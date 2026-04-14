@@ -71,6 +71,7 @@ typedef enum {
 /* ------------------------------------------------------------------ */
 typedef struct container_record {
     char              id[CONTAINER_ID_LEN];
+    char              rootfs[PATH_MAX];
     pid_t             host_pid;
     time_t            started_at;
     container_state_t state;
@@ -142,6 +143,7 @@ typedef struct {
 
 /* Global supervisor context pointer — used by signal handlers */
 static supervisor_ctx_t *g_ctx = NULL;
+static volatile sig_atomic_t g_run_client_interrupted = 0;
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                             */
@@ -231,10 +233,27 @@ static const char *state_to_string(container_state_t state)
     case CONTAINER_STARTING: return "starting";
     case CONTAINER_RUNNING:  return "running";
     case CONTAINER_STOPPED:  return "stopped";
-    case CONTAINER_KILLED:   return "killed";
+    case CONTAINER_KILLED:   return "hard_limit_killed";
     case CONTAINER_EXITED:   return "exited";
     default:                 return "unknown";
     }
+}
+
+/* Caller must hold metadata_lock */
+static int has_running_rootfs_conflict(supervisor_ctx_t *ctx,
+                                       const char *container_id,
+                                       const char *rootfs)
+{
+    container_record_t *r;
+    for (r = ctx->containers; r; r = r->next) {
+        if (strcmp(r->id, container_id) == 0)
+            continue;
+        if (r->state != CONTAINER_RUNNING && r->state != CONTAINER_STARTING)
+            continue;
+        if (strcmp(r->rootfs, rootfs) == 0)
+            return 1;
+    }
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -509,8 +528,10 @@ static void sigchld_handler(int sig)
                 /* distinguish manual stop vs kernel hard-limit kill */
                 if (r->stop_requested)
                     r->state = CONTAINER_STOPPED;
-                else
+                else if (r->exit_signal == SIGKILL)
                     r->state = CONTAINER_KILLED; /* hard_limit_killed */
+                else
+                    r->state = CONTAINER_EXITED;
             }
 
             /* Unregister from kernel monitor */
@@ -618,6 +639,7 @@ static container_record_t *launch_container(supervisor_ctx_t *ctx,
         return NULL;
     }
     strncpy(rec->id, req->container_id, sizeof(rec->id) - 1);
+    strncpy(rec->rootfs, req->rootfs, sizeof(rec->rootfs) - 1);
     rec->host_pid          = child_pid;
     rec->started_at        = time(NULL);
     rec->state             = CONTAINER_RUNNING;
@@ -677,6 +699,9 @@ static void handle_request(supervisor_ctx_t *ctx, int client_fd)
         /* Check duplicate ID */
         pthread_mutex_lock(&ctx->metadata_lock);
         container_record_t *existing = find_container(ctx, req.container_id);
+        int rootfs_conflict = has_running_rootfs_conflict(ctx,
+                                                          req.container_id,
+                                                          req.rootfs);
         pthread_mutex_unlock(&ctx->metadata_lock);
 
         if (existing && (existing->state == CONTAINER_RUNNING ||
@@ -684,6 +709,13 @@ static void handle_request(supervisor_ctx_t *ctx, int client_fd)
             resp.status = -1;
             snprintf(resp.message, sizeof(resp.message),
                      "container '%s' already running", req.container_id);
+            break;
+        }
+        if (rootfs_conflict) {
+            resp.status = -1;
+            snprintf(resp.message, sizeof(resp.message),
+                     "rootfs '%s' already used by a running container",
+                     req.rootfs);
             break;
         }
 
@@ -705,6 +737,9 @@ static void handle_request(supervisor_ctx_t *ctx, int client_fd)
     case CMD_RUN: {
         pthread_mutex_lock(&ctx->metadata_lock);
         container_record_t *existing = find_container(ctx, req.container_id);
+        int rootfs_conflict = has_running_rootfs_conflict(ctx,
+                                                          req.container_id,
+                                                          req.rootfs);
         pthread_mutex_unlock(&ctx->metadata_lock);
 
         if (existing && (existing->state == CONTAINER_RUNNING ||
@@ -712,6 +747,13 @@ static void handle_request(supervisor_ctx_t *ctx, int client_fd)
             resp.status = -1;
             snprintf(resp.message, sizeof(resp.message),
                      "container '%s' already running", req.container_id);
+            break;
+        }
+        if (rootfs_conflict) {
+            resp.status = -1;
+            snprintf(resp.message, sizeof(resp.message),
+                     "rootfs '%s' already used by a running container",
+                     req.rootfs);
             break;
         }
 
@@ -769,7 +811,10 @@ static void handle_request(supervisor_ctx_t *ctx, int client_fd)
         }
         pthread_mutex_unlock(&ctx->metadata_lock);
         resp.status = 0;
-        strncpy(resp.message, buf, sizeof(resp.message) - 1);
+        snprintf(resp.message, sizeof(resp.message), "container table:");
+        write(client_fd, &resp, sizeof(resp));
+        write(client_fd, buf, (size_t)off);
+        return;
         break;
     }
 
@@ -1037,6 +1082,61 @@ static int send_control_request(const control_request_t *req)
     }
 
     control_response_t resp;
+    if (req->kind == CMD_RUN) {
+        int stop_forwarded = 0;
+        while (1) {
+            fd_set rfds;
+            struct timeval tv;
+            FD_ZERO(&rfds);
+            FD_SET(fd, &rfds);
+            tv.tv_sec = 0;
+            tv.tv_usec = 200000; /* 200 ms */
+
+            int sel = select(fd + 1, &rfds, NULL, NULL, &tv);
+            if (sel < 0) {
+                if (errno == EINTR)
+                    continue;
+                perror("select response");
+                close(fd);
+                return 1;
+            }
+
+            if (sel > 0 && FD_ISSET(fd, &rfds))
+                break;
+
+            if (g_run_client_interrupted && !stop_forwarded) {
+                control_request_t stop_req;
+                int stop_fd;
+                struct sockaddr_un stop_addr;
+
+                memset(&stop_req, 0, sizeof(stop_req));
+                stop_req.kind = CMD_STOP;
+                strncpy(stop_req.container_id, req->container_id,
+                        sizeof(stop_req.container_id) - 1);
+
+                stop_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+                if (stop_fd >= 0) {
+                    memset(&stop_addr, 0, sizeof(stop_addr));
+                    stop_addr.sun_family = AF_UNIX;
+                    strncpy(stop_addr.sun_path, CONTROL_PATH,
+                            sizeof(stop_addr.sun_path) - 1);
+
+                    if (connect(stop_fd, (struct sockaddr *)&stop_addr,
+                                sizeof(stop_addr)) == 0) {
+                        if (write(stop_fd, &stop_req, sizeof(stop_req)) ==
+                            (ssize_t)sizeof(stop_req)) {
+                            control_response_t stop_resp;
+                            (void)read(stop_fd, &stop_resp,
+                                       sizeof(stop_resp));
+                        }
+                    }
+                    close(stop_fd);
+                }
+                stop_forwarded = 1;
+            }
+        }
+    }
+
     if (read(fd, &resp, sizeof(resp)) != (ssize_t)sizeof(resp)) {
         perror("read response");
         close(fd);
@@ -1045,7 +1145,7 @@ static int send_control_request(const control_request_t *req)
     printf("%s\n", resp.message);
 
     /* For CMD_LOGS the supervisor streams log content after the header */
-    if (req->kind == CMD_LOGS && resp.status == 0) {
+    if ((req->kind == CMD_LOGS || req->kind == CMD_PS) && resp.status == 0) {
         char buf[4096];
         ssize_t n;
         while ((n = read(fd, buf, sizeof(buf))) > 0)
@@ -1053,7 +1153,15 @@ static int send_control_request(const control_request_t *req)
     }
 
     close(fd);
+    if (req->kind == CMD_RUN)
+        return (resp.status >= 0 && resp.status <= 255) ? resp.status : 1;
     return (resp.status == 0) ? 0 : 1;
+}
+
+static void run_client_signal_handler(int sig)
+{
+    (void)sig;
+    g_run_client_interrupted = 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1082,6 +1190,8 @@ static int cmd_start(int argc, char *argv[])
 static int cmd_run(int argc, char *argv[])
 {
     control_request_t req;
+    struct sigaction sa, old_int, old_term;
+    int rc;
     if (argc < 5) {
         fprintf(stderr,
                 "Usage: %s run <id> <container-rootfs> <command> "
@@ -1096,7 +1206,19 @@ static int cmd_run(int argc, char *argv[])
     req.soft_limit_bytes = DEFAULT_SOFT_LIMIT;
     req.hard_limit_bytes = DEFAULT_HARD_LIMIT;
     if (parse_optional_flags(&req, argc, argv, 5) != 0) return 1;
-    return send_control_request(&req);
+
+    g_run_client_interrupted = 0;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = run_client_signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, &old_int);
+    sigaction(SIGTERM, &sa, &old_term);
+
+    rc = send_control_request(&req);
+
+    sigaction(SIGINT, &old_int, NULL);
+    sigaction(SIGTERM, &old_term, NULL);
+    return rc;
 }
 
 static int cmd_ps(void)
