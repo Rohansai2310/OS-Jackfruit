@@ -148,7 +148,7 @@ Container ID, host PID, state, and limits are visible in one listing.
 Logs captured from container stdout/stderr are persisted and retrievable.
 
 ### SS4. CLI to supervisor IPC
-![CLI IPC](screenshots/ss2_metadata_ps.jpeg)
+![CLI IPC](screenshots/ss4_cli_ipc.jpeg)
 CLI client commands are issued from a separate terminal, and the supervisor returns a structured response over the Unix domain socket control channel.
 
 ### SS5. Soft-limit warning event
