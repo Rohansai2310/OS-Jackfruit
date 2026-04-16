@@ -232,10 +232,10 @@ Two CPU-intensive workloads were started concurrently with different priorities.
 
 | Container | Nice Value | Observed Behavior |
 | :-- | :-- | :-- |
-| Alpha | -20 | Received larger CPU share and completed `cpu_hog` faster |
-| Beta | 19 | Lower CPU share and delayed completion under contention |
+| Alpha (hipri) | -5 | Received significantly higher CPU share (~99–100% in pidstat) and completed `cpu_hog` faster |
+| Beta (lopri) | 10 | Received lower CPU share (~85–96% in pidstat) and showed slower progress under contention |
 
-Interpretation: CFS did not starve the lower-priority task completely, but weighted virtual runtime strongly favored the higher-priority process.
+Interpretation: CFS did not starve the lower-priority task completely, but weighted virtual runtime strongly favored the higher-priority process. These observations are consistent with the pidstat output shown in SS7.
 
 ---
 
